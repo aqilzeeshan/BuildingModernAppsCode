@@ -1,0 +1,516 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+Parameters:
+  CognitoDomain:
+    Type: String
+    Default: fancy-domain4
+    MinLength: 3
+    MaxLength: 63
+    AllowedPattern: ^[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?$
+    Description: Enter a string. Must be alpha numeric 3-63 in length.
+
+Resources:
+
+  GetReviewLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import re 
+
+          def lambda_handler(event, context):
+              product_id_str = event['product_id']
+              S3_BUCKET = 'data-for-s3-select'
+              S3_FILE = 'data.json'
+
+              s3 = boto3.client('s3')
+
+              r = s3.select_object_content(
+                      Bucket=S3_BUCKET,
+                      Key=S3_FILE,
+                      ExpressionType='SQL',
+                       Expression="SELECT * FROM s3object[*].products[*] r where r.product_id= '" + product_id_str + "'",
+                      InputSerialization={'JSON': {"Type": "Lines"}},
+                      OutputSerialization={'JSON': {}}
+              )
+              
+              all_reviews_list = []
+              helper_format_str = ""
+              for event in r['Payload']:
+                  if 'Records' in event:
+                      helper_format_str = event['Records']['Payload'].decode('utf-8')
+                      helper_format_str = helper_format_str.replace("review_headline", "review_headline_str").replace("review_body", "review_body_str")
+                      all_reviews_list = helper_format_str.splitlines()
+                      
+              result_list = []
+              for review_chunk in all_reviews_list:
+                  result_list.append(json.loads(review_chunk))
+              
+              return {
+                  "product_id_str" : product_id_str,
+                  "reviews_arr": result_list
+              }
+
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.8
+      Timeout: 60
+
+  GetRatingLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import statistics
+          import re
+
+          def lambda_handler(event, context):
+              PRODUCT = event['product_id']
+              S3_BUCKET = 'data-for-s3-select'
+              S3_FILE = 'data.json'
+
+              s3 = boto3.client('s3')
+
+              r = s3.select_object_content(
+                      Bucket=S3_BUCKET,
+                      Key=S3_FILE,
+                      ExpressionType='SQL',
+                      Expression="SELECT r.reviews FROM s3object[*].products[*] r where r.product_id= '" + PRODUCT + "'",
+                      InputSerialization={'JSON': {"Type": "Lines"}},
+                      OutputSerialization={'JSON': {}}
+              )
+
+              for event in r['Payload']:
+                  if 'Records' in event:
+                      records = event['Records']['Payload'].decode('utf-8')
+                      n_records = (re.findall(r'\d+', records))
+                      results = list(map(float, n_records))
+                      f_results = statistics.mean(results)
+                      
+              return {
+                  'product_id_str': PRODUCT,
+                  'average_star_review_float': f_results
+              }
+
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.8
+      Timeout: 60     
+
+  CreateReportLambdaFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |
+          import json
+          import base64
+
+          def lambda_handler(event, context):
+              token_str = ""
+              ipv4_str = ""
+              decoded = {}
+              return_me = {}
+              name_str = ""
+              extract_str = ""
+              cell_str = ""
+              return_me["message_str"] =  "Report processing, check your phone shortly"
+              print("Before")
+              print(json.dumps(event))
+              print("After")
+              if "Authorization" in json.dumps(event):
+                  #i.e we are at the website and have a valid Bearer token passed
+                  token_str = event["params"]["header"]["Authorization"]
+                  extract_str = token_str.replace("Bearer ", "").strip().split(".")[1]
+                  extract_str += '=' * (-len(extract_str) % 4)
+                  decoded = json.loads(base64.b64decode(extract_str))
+                  cell_str = decoded["phone_number"]
+                  name_str = decoded["cognito:username"]
+                  ipv4_str = event["params"]["header"]["X-Forwarded-For"]
+                  return_me["cell_str"] = cell_str
+                  return_me["name_str"] = name_str
+                  return_me["name_str"] = decoded["cognito:username"]
+                  return_me["ipv4_str"] = ipv4_str
+                  return_me["message_str"] = "Report Processing"
+              return return_me
+
+      Handler: index.lambda_handler
+      MemorySize: 128
+      Role: !GetAtt 
+        - LambdaExecutionRole
+        - Arn
+      Runtime: python3.8
+      Timeout: 60
+
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service:
+                - lambda.amazonaws.com
+        Version: 2012-10-17
+      Path: /
+      Policies:
+        - PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Action: 'logs:*'
+                Effect: Allow
+                Resource: 'arn:aws:logs:*:*:*'
+              - Action: 's3:*'
+                Effect: Allow
+                Resource: '*'
+          PolicyName: LambdaPolicy
+  
+  GetReviewLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt GetReviewLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductRestApi}/*'
+
+  GetRatingLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:invokeFunction
+      FunctionName: !GetAtt GetRatingLambdaFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductRestApi}/*'
+
+  CreateReportLambdaPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:invokeFunction
+        FunctionName: !GetAtt CreateReportLambdaFunction.Arn
+        Principal: apigateway.amazonaws.com
+        SourceArn: !Sub 'arn:${AWS::Partition}:execute-api:${AWS::Region}:${AWS::AccountId}:${ProductRestApi}/*'
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: true
+          RequireUppercase: true
+      UsernameConfiguration: 
+        CaseSensitive: false
+      AdminCreateUserConfig:
+        AllowAdminCreateUserOnly: true
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+      AutoVerifiedAttributes:
+        - email
+      UserPoolName: !Sub ${CognitoDomain}-user-pool
+      UsernameAttributes:
+        - email
+      MfaConfiguration: "OFF"
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      AllowedOAuthFlowsUserPoolClient: true
+      CallbackURLs:
+        - http://localhost:8000/callback
+      LogoutURLs:
+        - http://localhost:8000/sign-out
+      AllowedOAuthFlows:
+        - implicit
+      AllowedOAuthScopes:
+        - openid
+        - profile
+      SupportedIdentityProviders:
+        - COGNITO
+
+  UserPoolDomain:
+    Type: AWS::Cognito::UserPoolDomain
+    Properties:
+      Domain: !Ref CognitoDomain
+      UserPoolId: !Ref UserPool
+
+
+
+  ProductRestApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      ApiKeySourceType: HEADER
+      Description: product(test) api
+      FailOnWarnings: true
+      EndpointConfiguration:
+        Types:
+          - EDGE
+      Name: CORS-Working-api
+
+  ProductAPIAuthorizer:
+    Type: AWS::ApiGateway::Authorizer
+    Properties:
+      IdentitySource: method.request.header.authorization
+      Name: ProductCognitoAuthorizer
+      ProviderARNs:
+        - Fn::GetAtt:
+            - UserPool
+            - Arn
+      RestApiId: !Ref ProductRestApi
+      Type: COGNITO_USER_POOLS
+
+  GetReviewsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ProductRestApi.RootResourceId
+      PathPart: 'get_reviews'
+      RestApiId: !Ref ProductRestApi
+
+  GetRatingsResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ProductRestApi.RootResourceId
+      PathPart: 'get_av_star_rating'
+      RestApiId: !Ref ProductRestApi
+
+  CreateReportResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt ProductRestApi.RootResourceId
+      PathPart: 'create_report'
+      RestApiId: !Ref ProductRestApi
+
+  ReviewRequestGET:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.product_id: false
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetReviewLambdaFunction.Arn}/invocations'
+        ConnectionType: INTERNET
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            StatusCode: '200'
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            {"product_id":"$util.escapeJavaScript($input.params('product_id'))"}
+        TimeoutInMillis: 29000
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+      OperationName: 'ListReviews'
+      ResourceId: !Ref GetReviewsResource
+      RestApiId: !Ref ProductRestApi
+
+  RatingRequestGET:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: NONE
+      HttpMethod: GET
+      RequestParameters:
+        method.request.querystring.product_id: false
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${GetRatingLambdaFunction.Arn}/invocations'
+        ConnectionType: INTERNET
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            StatusCode: '200'
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            {"product_id":"$util.escapeJavaScript($input.params('product_id'))"}
+        TimeoutInMillis: 29000
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+      OperationName: 'ListRating'
+      ResourceId: !Ref GetRatingsResource
+      RestApiId: !Ref ProductRestApi
+  ProductStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ProductDeployment
+      Description: Mock API Stage v0
+      RestApiId: !Ref ProductRestApi
+      StageName: 'v0'
+
+  ReportRequestPOST:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      ApiKeyRequired: false
+      AuthorizationType: COGNITO_USER_POOLS
+      AuthorizerId: !Ref ProductAPIAuthorizer
+      HttpMethod: POST
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:${AWS::Partition}:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${CreateReportLambdaFunction.Arn}/invocations'
+        ConnectionType: INTERNET
+        IntegrationResponses:
+          - ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'POST'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            StatusCode: '200'
+        PassthroughBehavior: WHEN_NO_TEMPLATES
+        RequestTemplates:
+          application/json: |
+            ##  See http://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-mapping-template-reference.html
+            ##  This template will pass through all parameters including path, querystring, header, stage variables, and context through to the integration endpoint via the body/payload
+            #set($allParams = $input.params())
+            {
+            "body" : $input.json('$'),
+            "params" : {
+            #foreach($type in $allParams.keySet())
+                #set($params = $allParams.get($type))
+            "$type" : {
+                #foreach($paramName in $params.keySet())
+                "$paramName" : "$util.escapeJavaScript($params.get($paramName))"
+                    #if($foreach.hasNext),#end
+                #end
+            }
+                #if($foreach.hasNext),#end
+            #end
+            },
+            "stageVariables" : {
+            #foreach($key in $stageVariables.keySet())
+            "$key" : "$util.escapeJavaScript($stageVariables.get($key))"
+                #if($foreach.hasNext),#end
+            #end
+            },
+            "context" : {
+                "accountId" : "$context.identity.accountId",
+                "apiId" : "$context.apiId",
+                "apiKey" : "$context.identity.apiKey",
+                "authorizerPrincipalId" : "$context.authorizer.principalId",
+                "caller" : "$context.identity.caller",
+                "cognitoAuthenticationProvider" : "$context.identity.cognitoAuthenticationProvider",
+                "cognitoAuthenticationType" : "$context.identity.cognitoAuthenticationType",
+                "cognitoIdentityId" : "$context.identity.cognitoIdentityId",
+                "cognitoIdentityPoolId" : "$context.identity.cognitoIdentityPoolId",
+                "httpMethod" : "$context.httpMethod",
+                "stage" : "$context.stage",
+                "sourceIp" : "$context.identity.sourceIp",
+                "user" : "$context.identity.user",
+                "userAgent" : "$context.identity.userAgent",
+                "userArn" : "$context.identity.userArn",
+                "requestId" : "$context.requestId",
+                "resourceId" : "$context.resourceId",
+                "resourcePath" : "$context.resourcePath"
+                }
+            }
+        TimeoutInMillis: 29000
+      MethodResponses:
+        - ResponseModels:
+            application/json: Empty
+          ResponseParameters:
+            method.response.header.Access-Control-Allow-Headers: false
+            method.response.header.Access-Control-Allow-Methods: false
+            method.response.header.Access-Control-Allow-Origin: false
+          StatusCode: '200'
+      OperationName: 'CreateReport'
+      ResourceId: !Ref CreateReportResource
+      RestApiId: !Ref ProductRestApi
+
+  ReportRequestCORSOption:
+      Type: "AWS::ApiGateway::Method"
+      Properties:
+        ResourceId: !Ref CreateReportResource
+        RestApiId: !Ref ProductRestApi
+        AuthorizationType: NONE
+        HttpMethod: OPTIONS
+        Integration:
+          Type: MOCK
+          IntegrationResponses:
+            - ResponseParameters:
+                method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+                method.response.header.Access-Control-Allow-Methods: "'POST,OPTIONS'"
+                method.response.header.Access-Control-Allow-Origin: "'*'"
+              ResponseTemplates:
+                application/json: ''
+              StatusCode: '200'
+          PassthroughBehavior: NEVER
+          RequestTemplates:
+            application/json: '{"statusCode": 200}'
+        MethodResponses:
+          - ResponseModels:
+              application/json: Empty
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: true
+              method.response.header.Access-Control-Allow-Methods: true
+              method.response.header.Access-Control-Allow-Origin: true
+            StatusCode: '200'
+
+  ProductStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ProductDeployment
+      Description: Mock API Stage v0
+      RestApiId: !Ref ProductRestApi
+      StageName: 'v0'
+  ProductDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: 
+      - ReviewRequestGET
+      - RatingRequestGET
+      - ReportRequestPOST
+      - ReportRequestCORSOption
+    Properties:
+      Description: Mock API Deployment
+      RestApiId: !Ref ProductRestApi
+
+
+Outputs:
+  CognitoUserPoolID:
+    Value: !Ref UserPool
+    Description: The UserPool ID
+  CognitoAppClientID:
+    Value: !Ref UserPoolClient
+    Description: The app client
+  HostedUIURL:
+    Value: !Sub https://${CognitoDomain}.auth.us-east-1.amazoncognito.com/login?client_id=${UserPoolClient}&response_type=token&scope=openid+profile&redirect_uri=http://localhost:8000/callback
+    Description: The hosted UI URL

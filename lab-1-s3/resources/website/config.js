@@ -1,2 +1,2 @@
-var G_API_GW_URL_STR = null;
-var G_COGNITO_HOSTED_URL_STR = null;
+var G_API_GW_URL_STR = "https://1rt2tu74u8.execute-api.us-east-1.amazonaws.com/v0";
+var G_COGNITO_HOSTED_URL_STR = "https://fancy-domain4.auth.us-east-1.amazoncognito.com/login?client_id=5rcrondkdgol5apn4kupvp3e6m&response_type=token&scope=openid+profile&redirect_uri=http://localhost:5500/callback.html";
